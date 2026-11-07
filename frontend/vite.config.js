@@ -5,7 +5,7 @@ export default defineConfig({
   plugins: [react()],
   server: {
     port: 5173,
-    proxy: { '/api': { target: 'http://localhost:3000', rewrite: (p) => p.replace(/^\/api/, '') } },
+    proxy: { '/api': { target: process.env.API_URL || 'http://localhost:3000', rewrite: (p) => p.replace(/^\/api/, '') } },
   },
   test: {
     environment: 'jsdom',
