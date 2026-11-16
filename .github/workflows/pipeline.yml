@@ -1,0 +1,120 @@
+name: CI/CD Pipeline
+
+on:
+  pull_request:
+    branches: [develop, main]   # E1: PR hacia develop o main
+  push:
+    branches: [develop, main]   # E2: merge en develop / E3: merge en main
+
+permissions:
+  contents: read
+
+# Una ejecución nueva en la misma rama espera a que termine la anterior (no la cancela).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1-2. Checkout + Build
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install dependencies
+        uses: ./.github/actions/setup
+
+      - name: Build backend (compilar módulos Python)
+        working-directory: backend-fastapi
+        run: python -m compileall -q app
+
+      - name: Build frontend (vite build)
+        working-directory: frontend
+        run: npm run build
+
+  # ---------------------------------------------------------------------------
+  # 3. Test estáticas
+  # ---------------------------------------------------------------------------
+  test-static:
+    name: Test estáticas
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install dependencies
+        uses: ./.github/actions/setup
+
+      - name: Black (formato backend)
+        working-directory: backend-fastapi
+        run: black --check app tests
+
+      - name: Flake8 (linter backend)
+        working-directory: backend-fastapi
+        run: flake8 app tests
+
+      - name: Pylint (linter backend)
+        working-directory: backend-fastapi
+        run: pylint app
+
+      - name: ESLint (linter frontend)
+        working-directory: frontend
+        run: npm run lint
+
+  # ---------------------------------------------------------------------------
+  # 4. Test unitarias
+  # ---------------------------------------------------------------------------
+  test-unit:
+    name: Test unitarias
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install dependencies
+        uses: ./.github/actions/setup
+
+      - name: Pytest (backend)
+        working-directory: backend-fastapi
+        run: pytest --no-cov
+
+      - name: Vitest (frontend)
+        working-directory: frontend
+        run: npm test
+
+  # ---------------------------------------------------------------------------
+  # 5. Test cobertura (umbral 80 %)
+  # ---------------------------------------------------------------------------
+  test-coverage:
+    name: Test cobertura
+    needs: test-unit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install dependencies
+        uses: ./.github/actions/setup
+
+      - name: Cobertura backend (pytest-cov, mínimo 80 %)
+        working-directory: backend-fastapi
+        run: pytest --cov-fail-under=80
+
+      - name: Cobertura frontend (vitest, mínimo 80 %)
+        working-directory: frontend
+        run: npm run test:cov
+
+      - name: Subir reportes de cobertura
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-reports
+          path: |
+            backend-fastapi/coverage/
+            frontend/coverage/
