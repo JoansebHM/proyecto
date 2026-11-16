@@ -28,17 +28,18 @@
 ## 3. Pipeline CI — tareas
 - [x] Preparar la app: endpoint `GET /api/health` y rutas del backend con prefijo `/api`
 - [x] Preparar la app: Dockerfile del backend y del frontend (nginx)
-- [ ] Crear las ramas según la estrategia definida (`develop`) y proteger `main` y `develop`
-- [ ] Crear el pipeline en GitHub Actions (`.github/workflows/pipeline.yml`)
-- [ ] Checkout: paso de checkout del código
-- [ ] Build: instalar dependencias y compilar el backend
-- [ ] Build: instalar dependencias y compilar el frontend
-- [ ] Test estáticas: configurar el linter del backend y correrlo en el pipeline
-- [ ] Test estáticas: configurar el linter del frontend y correrlo en el pipeline
+- [x] Crear la rama `develop` según la estrategia definida
+- [ ] Proteger `main` y `develop` en GitHub (PR obligatorio)
+- [x] Crear el pipeline en GitHub Actions (`.github/workflows/pipeline.yml`)
+- [x] Checkout: paso de checkout del código
+- [x] Build: instalar dependencias y compilar el backend
+- [x] Build: instalar dependencias y compilar el frontend
+- [x] Test estáticas: configurar el linter del backend (Black, Flake8, Pylint) y correrlo en el pipeline
+- [x] Test estáticas: configurar el linter del frontend (ESLint) y correrlo en el pipeline
 - [ ] Test estáticas: configurar SonarCloud y correrlo en el pipeline
-- [ ] Test unitarias: correr las pruebas del backend en el pipeline
-- [ ] Test unitarias: correr las pruebas del frontend en el pipeline
-- [ ] Test cobertura: generar el reporte y aplicar el umbral en el pipeline
+- [x] Test unitarias: correr las pruebas del backend en el pipeline
+- [x] Test unitarias: correr las pruebas del frontend en el pipeline
+- [x] Test cobertura: generar el reporte y aplicar el umbral en el pipeline
 - [ ] Release: crear el artefacto a desplegar
 - [ ] Release: publicar el artefacto versionado
 - [ ] Ejecutar el CI con éxito
