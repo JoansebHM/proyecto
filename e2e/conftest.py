@@ -45,7 +45,7 @@ def app_url():
         env={**os.environ, "API_URL": f"http://localhost:{API_PORT}"},
     )
     try:
-        _wait_for(f"http://127.0.0.1:{API_PORT}/items")
+        _wait_for(f"http://127.0.0.1:{API_PORT}/api/health")
         _wait_for(f"http://localhost:{WEB_PORT}")
         yield f"http://localhost:{WEB_PORT}"
     finally:

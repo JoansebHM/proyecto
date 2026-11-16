@@ -5,7 +5,8 @@ export default defineConfig({
   plugins: [react()],
   server: {
     port: 5173,
-    proxy: { '/api': { target: process.env.API_URL || 'http://localhost:3000', rewrite: (p) => p.replace(/^\/api/, '') } },
+    // El backend atiende sus rutas bajo /api (igual que detrás del ALB), así que no se reescribe la ruta.
+    proxy: { '/api': { target: process.env.API_URL || 'http://localhost:3000' } },
   },
   test: {
     environment: 'jsdom',
