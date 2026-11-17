@@ -127,6 +127,31 @@ jobs:
             frontend/coverage/
 
   # ---------------------------------------------------------------------------
+  # 5b. SonarCloud (análisis de calidad con Quality Gate, usa los reportes de cobertura)
+  # ---------------------------------------------------------------------------
+  sonarcloud:
+    name: SonarCloud
+    needs: test-coverage
+    if: ${{ !cancelled() && needs.test-coverage.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0  # SonarCloud necesita el historial completo para saber qué es código nuevo
+
+      - name: Descargar reportes de cobertura
+        uses: actions/download-artifact@v7
+        with:
+          name: coverage-reports
+
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarqube-scan-action@v8
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: https://sonarcloud.io
+
+  # ---------------------------------------------------------------------------
   # 6. Validar origen de PR hacia main
   # ---------------------------------------------------------------------------
   validar-origen:
