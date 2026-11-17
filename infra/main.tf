@@ -83,7 +83,7 @@ resource "aws_cloudwatch_log_group" "ecs" {
   for_each = local.servicios
 
   name              = "/ecs/${local.name_prefix}-${each.key}"
-  retention_in_days = 7
+  retention_in_days = 30
 }
 
 # --- Cluster ECS ---
