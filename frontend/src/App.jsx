@@ -23,7 +23,10 @@ export default function App() {
   };
 
   const load = () => run(async () => setItems(await getItems()));
-  useEffect(() => { load(); }, []);
+  // Carga inicial: el estado se actualiza cuando responde la API, no de forma síncrona en el efecto.
+  useEffect(() => {
+    getItems().then(setItems).catch((e) => setError(e.message));
+  }, []);
 
   const add = (e) => {
     e.preventDefault();

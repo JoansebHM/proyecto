@@ -1,0 +1,9 @@
+[tool.black]
+line-length = 100
+
+[tool.pylint.format]
+max-line-length = 100
+
+[tool.pylint."messages control"]
+# Docstrings obligatorios en cada módulo/función generan ruido en una API pequeña.
+disable = ["missing-module-docstring", "missing-function-docstring", "missing-class-docstring"]
