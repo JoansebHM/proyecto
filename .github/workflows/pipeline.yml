@@ -20,6 +20,9 @@ jobs:
   # ---------------------------------------------------------------------------
   build:
     name: Build
+    # Si Validar origen falla, no se ejecuta nada más. Si se omite (PR a develop o push), sigue normal.
+    needs: validar-origen
+    if: ${{ !cancelled() && (needs.validar-origen.result == 'success' || needs.validar-origen.result == 'skipped') }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -42,6 +45,8 @@ jobs:
   test-static:
     name: Test estáticas
     needs: build
+    # Se repite el if: si un job anterior (validar-origen) se omite, el implícito success() omitiría este también.
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -72,6 +77,7 @@ jobs:
   test-unit:
     name: Test unitarias
     needs: build
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -94,6 +100,7 @@ jobs:
   test-coverage:
     name: Test cobertura
     needs: test-unit
+    if: ${{ !cancelled() && needs.test-unit.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
