@@ -118,3 +118,21 @@ jobs:
           path: |
             backend-fastapi/coverage/
             frontend/coverage/
+
+  # ---------------------------------------------------------------------------
+  # 6. Validar origen de PR hacia main
+  # ---------------------------------------------------------------------------
+  validar-origen:
+    name: Validar origen
+    if: github.event_name == 'pull_request' && github.base_ref == 'main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Solo develop puede integrarse en main
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          if [ "$HEAD_REF" != "develop" ]; then
+            echo "::error::Un PR hacia main debe salir de develop (este sale de '$HEAD_REF')"
+            exit 1
+          fi
+          echo "Origen válido: develop"
