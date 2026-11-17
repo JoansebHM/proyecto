@@ -1,0 +1,6 @@
+# Terraform: archivos locales que no se versionan (el lock de providers sí se versiona)
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
