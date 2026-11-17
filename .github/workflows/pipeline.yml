@@ -152,7 +152,75 @@ jobs:
           SONAR_HOST_URL: https://sonarcloud.io
 
   # ---------------------------------------------------------------------------
-  # 6. Validar origen de PR hacia main
+  # 6. Release: construir, escanear (Trivy) y publicar las imágenes en ECR
+  #    Solo corre al integrar en develop o main (no en los PR).
+  # ---------------------------------------------------------------------------
+  release:
+    name: Release
+    needs: [test-static, sonarcloud]
+    if: ${{ !cancelled() && github.event_name == 'push' && needs.test-static.result == 'success' && needs.sonarcloud.result == 'success' }}
+    runs-on: ubuntu-latest
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
+      AWS_DEFAULT_REGION: us-east-1
+    outputs:
+      backend_image: ${{ steps.imagenes.outputs.backend_image }}
+      frontend_image: ${{ steps.imagenes.outputs.frontend_image }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Login en ECR
+        id: ecr
+        run: |
+          REGISTRY="$(aws sts get-caller-identity --query Account --output text).dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
+          aws ecr get-login-password | docker login --username AWS --password-stdin "$REGISTRY"
+          echo "registry=$REGISTRY" >> "$GITHUB_OUTPUT"
+
+      - name: Definir nombres de las imágenes (etiqueta = SHA del commit)
+        id: imagenes
+        run: |
+          echo "backend_image=${{ steps.ecr.outputs.registry }}/proyecto-backend:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          echo "frontend_image=${{ steps.ecr.outputs.registry }}/proyecto-frontend:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Build imagen del backend
+        run: docker build -t "${{ steps.imagenes.outputs.backend_image }}" backend-fastapi
+
+      - name: Build imagen del frontend
+        run: docker build -t "${{ steps.imagenes.outputs.frontend_image }}" frontend
+
+      # Trivy falla el pipeline si encuentra vulnerabilidades CRÍTICAS que ya tengan corrección.
+      - name: Escaneo Trivy del backend
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0 (fijada por SHA)
+        with:
+          image-ref: ${{ steps.imagenes.outputs.backend_image }}
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
+          format: table
+
+      - name: Escaneo Trivy del frontend
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0 (fijada por SHA)
+        with:
+          image-ref: ${{ steps.imagenes.outputs.frontend_image }}
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
+          format: table
+
+      - name: Publicar imágenes en ECR (SHA y latest)
+        run: |
+          for componente in backend frontend; do
+            imagen="${{ steps.ecr.outputs.registry }}/proyecto-${componente}"
+            docker tag "${imagen}:${GITHUB_SHA}" "${imagen}:latest"
+            docker push "${imagen}:${GITHUB_SHA}"
+            docker push "${imagen}:latest"
+          done
+
+  # ---------------------------------------------------------------------------
+  # 7. Validar origen de PR hacia main
   # ---------------------------------------------------------------------------
   validar-origen:
     name: Validar origen
