@@ -5,6 +5,17 @@ on:
     branches: [develop, main]   # E1: PR hacia develop o main
   push:
     branches: [develop, main]   # E2: merge en develop / E3: merge en main
+  workflow_dispatch:            # E4: botón de pánico (rollback manual)
+    inputs:
+      environment:
+        description: Ambiente donde se hace el rollback
+        type: choice
+        options: [staging, production]
+        required: true
+      version:
+        description: SHA completo del commit al que se vuelve (debe existir en ECR)
+        type: string
+        required: true
 
 permissions:
   contents: read
@@ -22,7 +33,7 @@ jobs:
     name: Build
     # Si Validar origen falla, no se ejecuta nada más. Si se omite (PR a develop o push), sigue normal.
     needs: validar-origen
-    if: ${{ !cancelled() && (needs.validar-origen.result == 'success' || needs.validar-origen.result == 'skipped') }}
+    if: ${{ !cancelled() && github.event_name != 'workflow_dispatch' && (needs.validar-origen.result == 'success' || needs.validar-origen.result == 'skipped') }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -330,18 +341,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Esperar la versión nueva en /api/health (cada 10 s, máximo 5 min)
-        run: |
-          for intento in $(seq 1 30); do
-            version="$(curl -fsS "${APP_BASE_URL}/api/health" 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("version",""))' 2>/dev/null || true)"
-            echo "Intento ${intento}/30: versión desplegada = '${version}'"
-            if [ "$version" = "$GITHUB_SHA" ]; then
-              echo "La versión ${GITHUB_SHA} ya está desplegada."
-              exit 0
-            fi
-            sleep 10
-          done
-          echo "::error::Staging no respondió la versión ${GITHUB_SHA} en 5 minutos"
-          exit 1
+        run: scripts/esperar-version.sh "$APP_BASE_URL" "$GITHUB_SHA"
 
       - name: Set up Python
         uses: actions/setup-python@v7
@@ -362,6 +362,249 @@ jobs:
         with:
           name: reporte-preprod
           path: reporte-preprod.html
+
+  # ---------------------------------------------------------------------------
+  # 7. IaC: validar y planear la infraestructura de producción (solo push a main)
+  # ---------------------------------------------------------------------------
+  iac-production:
+    name: IaC (production)
+    needs: release
+    if: ${{ !cancelled() && needs.release.result == 'success' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
+      AWS_DEFAULT_REGION: us-east-1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e  # v4.0.1 (fijada por SHA)
+        with:
+          terraform_wrapper: false  # para poder leer `terraform output` limpio
+
+      - name: Terraform init (estado remoto en S3)
+        run: terraform -chdir=infra init -input=false -backend-config=backend.hcl
+
+      - name: Seleccionar el workspace production (se crea si no existe)
+        run: terraform -chdir=infra workspace select -or-create production
+
+      - name: Terraform plan (imágenes con el SHA del commit)
+        run: |
+          terraform -chdir=infra plan -input=false \
+            -var "environment_name=production" \
+            -var "image_tag=${GITHUB_SHA}" \
+            -out=tfplan
+
+      - name: Subir el plan para que Deploy aplique exactamente este plan
+        uses: actions/upload-artifact@v7
+        with:
+          name: tfplan-production
+          path: infra/tfplan
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # 8-9. Deploy Infra + Deploy App en producción
+  #      Usa el environment `production`: si tiene revisores requeridos en GitHub,
+  #      el job espera su aprobación antes de aplicar.
+  # ---------------------------------------------------------------------------
+  deploy-production:
+    name: Deploy production
+    needs: iac-production
+    if: ${{ !cancelled() && needs.iac-production.result == 'success' }}
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
+      AWS_DEFAULT_REGION: us-east-1
+    outputs:
+      app_url: ${{ steps.salida.outputs.app_url }}
+      version_anterior: ${{ steps.anterior.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e  # v4.0.1 (fijada por SHA)
+        with:
+          terraform_wrapper: false  # para poder leer `terraform output` limpio
+
+      - name: Descargar el plan
+        uses: actions/download-artifact@v7
+        with:
+          name: tfplan-production
+          path: infra
+
+      - name: Terraform init
+        run: terraform -chdir=infra init -input=false -backend-config=backend.hcl
+
+      - name: Seleccionar el workspace production
+        run: terraform -chdir=infra workspace select production
+
+      # Se guarda el SHA que corre ANTES de desplegar: es la versión a la que vuelve el rollback.
+      - name: Guardar la versión que corre hoy en producción
+        id: anterior
+        run: |
+          version=""
+          if url="$(terraform -chdir=infra output -raw alb_url 2>/dev/null)"; then
+            version="$(curl -fsS --max-time 10 "${url}/api/health" 2>/dev/null \
+              | python3 -c 'import json,sys; print(json.load(sys.stdin).get("version",""))' 2>/dev/null || true)"
+          fi
+          echo "Versión anterior en producción: '${version:-ninguna (primer despliegue)}'"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy Infra + App (terraform apply del plan)
+        run: terraform -chdir=infra apply -input=false tfplan
+
+      - name: Leer la URL de producción
+        id: salida
+        run: echo "app_url=$(terraform -chdir=infra output -raw alb_url)" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # 11. Tests Post-Prod: smoke tests (solo lectura) contra producción
+  # ---------------------------------------------------------------------------
+  test-postprod:
+    name: Tests Post-Prod
+    needs: deploy-production
+    if: ${{ !cancelled() && needs.deploy-production.result == 'success' }}
+    runs-on: ubuntu-latest
+    env:
+      APP_BASE_URL: ${{ needs.deploy-production.outputs.app_url }}
+      EXPECTED_VERSION: ${{ github.sha }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Esperar la versión nueva en /api/health (cada 10 s, máximo 5 min)
+        run: scripts/esperar-version.sh "$APP_BASE_URL" "$GITHUB_SHA"
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+
+      - name: Instalar dependencias de los smoke tests
+        run: |
+          pip install --only-binary :all: --require-hashes -r smoke/requirements.txt
+
+      - name: Smoke tests contra producción
+        run: pytest smoke --html=reporte-postprod.html --self-contained-html
+
+      - name: Subir el reporte HTML
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: reporte-postprod
+          path: reporte-postprod.html
+
+  # ---------------------------------------------------------------------------
+  # 12. Rollback automático: si fallan los smoke tests, vuelve a la versión anterior
+  # ---------------------------------------------------------------------------
+  rollback-production:
+    name: Rollback automático
+    needs: [deploy-production, test-postprod]
+    if: ${{ !cancelled() && needs.test-postprod.result == 'failure' }}
+    runs-on: ubuntu-latest
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
+      AWS_DEFAULT_REGION: us-east-1
+      VERSION_ANTERIOR: ${{ needs.deploy-production.outputs.version_anterior }}
+      APP_URL: ${{ needs.deploy-production.outputs.app_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Sin versión anterior no hay a qué volver
+        if: ${{ env.VERSION_ANTERIOR == '' }}
+        run: |
+          echo "::warning::Es el primer despliegue de producción: no hay versión anterior, se omite el rollback."
+
+      - name: Set up Terraform
+        if: ${{ env.VERSION_ANTERIOR != '' }}
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e  # v4.0.1 (fijada por SHA)
+        with:
+          terraform_wrapper: false  # para poder leer `terraform output` limpio
+
+      - name: Terraform init
+        if: ${{ env.VERSION_ANTERIOR != '' }}
+        run: terraform -chdir=infra init -input=false -backend-config=backend.hcl
+
+      - name: Seleccionar el workspace production
+        if: ${{ env.VERSION_ANTERIOR != '' }}
+        run: terraform -chdir=infra workspace select production
+
+      - name: Volver a la versión anterior (terraform apply con su SHA)
+        if: ${{ env.VERSION_ANTERIOR != '' }}
+        run: |
+          terraform -chdir=infra apply -input=false -auto-approve \
+            -var "environment_name=production" \
+            -var "image_tag=${VERSION_ANTERIOR}"
+
+      - name: Esperar la versión anterior en /api/health
+        if: ${{ env.VERSION_ANTERIOR != '' }}
+        run: scripts/esperar-version.sh "$APP_URL" "$VERSION_ANTERIOR"
+
+  # ---------------------------------------------------------------------------
+  # 13. Rollback manual (botón de pánico): Actions > Run workflow
+  #     Para `production` usa el environment `production` (con su aprobación, si la tiene).
+  # ---------------------------------------------------------------------------
+  rollback-manual:
+    name: Rollback manual
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ inputs.environment }}
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
+      AWS_DEFAULT_REGION: us-east-1
+      AMBIENTE: ${{ inputs.environment }}
+      VERSION: ${{ inputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Validar el SHA recibido
+        run: |
+          if ! [[ "$VERSION" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::La versión debe ser un SHA completo de 40 caracteres hexadecimales"
+            exit 1
+          fi
+
+      - name: Verificar que las imágenes de ese SHA existen en ECR
+        run: |
+          for componente in backend frontend; do
+            aws ecr describe-images --repository-name "proyecto-${componente}" --image-ids "imageTag=${VERSION}" > /dev/null \
+              || { echo "::error::No existe proyecto-${componente}:${VERSION} en ECR"; exit 1; }
+          done
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e  # v4.0.1 (fijada por SHA)
+        with:
+          terraform_wrapper: false  # para poder leer `terraform output` limpio
+
+      - name: Terraform init
+        run: terraform -chdir=infra init -input=false -backend-config=backend.hcl
+
+      - name: Seleccionar el workspace del ambiente (debe existir)
+        run: terraform -chdir=infra workspace select "$AMBIENTE"
+
+      - name: Desplegar las imágenes de ese SHA
+        run: |
+          terraform -chdir=infra apply -input=false -auto-approve \
+            -var "environment_name=${AMBIENTE}" \
+            -var "image_tag=${VERSION}"
+
+      - name: Esperar esa versión en /api/health
+        run: scripts/esperar-version.sh "$(terraform -chdir=infra output -raw alb_url)" "$VERSION"
 
   # ---------------------------------------------------------------------------
   # Validar origen de PR hacia main

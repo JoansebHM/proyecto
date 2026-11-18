@@ -108,6 +108,8 @@ Aplica el plan del paso anterior: crea o actualiza la infraestructura en AWS par
 **9. Deploy App**
 Despliega en la infraestructura del ambiente la versión creada en el Release.
 
+> En `production`, el job de Deploy usa el *environment* `production` de GitHub. Si ese environment tiene **revisores requeridos** (Settings → Environments), el pipeline se detiene y espera su aprobación antes de aplicar.
+
 **10. Tests Pre-Prod** (solo `staging`)
 Ejecuta pruebas de aceptación contra la app desplegada en `staging`: valida flujos completos del usuario antes de pasar a producción.
 1. Espera la versión nueva: consulta `/api/health` cada 10 s (máximo 5 min) hasta que responda el SHA de la ejecución.
