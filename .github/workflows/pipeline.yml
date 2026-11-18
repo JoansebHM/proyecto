@@ -231,7 +231,141 @@ jobs:
           done
 
   # ---------------------------------------------------------------------------
-  # 7. Validar origen de PR hacia main
+  # 7. IaC: validar y planear la infraestructura de staging (solo push a develop)
+  # ---------------------------------------------------------------------------
+  iac-staging:
+    name: IaC (staging)
+    needs: release
+    if: ${{ !cancelled() && needs.release.result == 'success' && github.ref == 'refs/heads/develop' }}
+    runs-on: ubuntu-latest
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
+      AWS_DEFAULT_REGION: us-east-1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e  # v4.0.1 (fijada por SHA)
+
+      - name: Terraform init (estado remoto en S3)
+        run: terraform -chdir=infra init -input=false -backend-config=backend.hcl
+
+      - name: Seleccionar el workspace staging (se crea si no existe)
+        run: terraform -chdir=infra workspace select -or-create staging
+
+      - name: Terraform plan (imágenes con el SHA del commit)
+        run: |
+          terraform -chdir=infra plan -input=false \
+            -var "environment_name=staging" \
+            -var "image_tag=${GITHUB_SHA}" \
+            -out=tfplan
+
+      - name: Subir el plan para que Deploy aplique exactamente este plan
+        uses: actions/upload-artifact@v7
+        with:
+          name: tfplan-staging
+          path: infra/tfplan
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # 8-9. Deploy Infra + Deploy App en staging
+  #      Un solo `terraform apply`: la infraestructura y la versión de la app
+  #      (image_tag = SHA) están en el mismo plan.
+  # ---------------------------------------------------------------------------
+  deploy-staging:
+    name: Deploy staging
+    needs: iac-staging
+    if: ${{ !cancelled() && needs.iac-staging.result == 'success' }}
+    runs-on: ubuntu-latest
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
+      AWS_DEFAULT_REGION: us-east-1
+    outputs:
+      app_url: ${{ steps.salida.outputs.app_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e  # v4.0.1 (fijada por SHA)
+        with:
+          terraform_wrapper: false  # para poder leer `terraform output` limpio
+
+      - name: Descargar el plan
+        uses: actions/download-artifact@v7
+        with:
+          name: tfplan-staging
+          path: infra
+
+      - name: Terraform init
+        run: terraform -chdir=infra init -input=false -backend-config=backend.hcl
+
+      - name: Seleccionar el workspace staging
+        run: terraform -chdir=infra workspace select staging
+
+      - name: Deploy Infra + App (terraform apply del plan)
+        run: terraform -chdir=infra apply -input=false tfplan
+
+      - name: Leer la URL de staging
+        id: salida
+        run: echo "app_url=$(terraform -chdir=infra output -raw alb_url)" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # 10. Tests Pre-Prod: E2E (Playwright) contra la app desplegada en staging
+  # ---------------------------------------------------------------------------
+  test-preprod:
+    name: Tests Pre-Prod
+    needs: deploy-staging
+    if: ${{ !cancelled() && needs.deploy-staging.result == 'success' }}
+    runs-on: ubuntu-latest
+    env:
+      APP_BASE_URL: ${{ needs.deploy-staging.outputs.app_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Esperar la versión nueva en /api/health (cada 10 s, máximo 5 min)
+        run: |
+          for intento in $(seq 1 30); do
+            version="$(curl -fsS "${APP_BASE_URL}/api/health" 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("version",""))' 2>/dev/null || true)"
+            echo "Intento ${intento}/30: versión desplegada = '${version}'"
+            if [ "$version" = "$GITHUB_SHA" ]; then
+              echo "La versión ${GITHUB_SHA} ya está desplegada."
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::Staging no respondió la versión ${GITHUB_SHA} en 5 minutos"
+          exit 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+
+      - name: Instalar Playwright
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r e2e/requirements.txt
+          playwright install --with-deps chromium
+
+      - name: Pruebas E2E contra staging
+        run: pytest e2e --html=reporte-preprod.html --self-contained-html
+
+      - name: Subir el reporte HTML
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: reporte-preprod
+          path: reporte-preprod.html
+
+  # ---------------------------------------------------------------------------
+  # Validar origen de PR hacia main
   # ---------------------------------------------------------------------------
   validar-origen:
     name: Validar origen

@@ -31,7 +31,16 @@ def _wait_for(url: str, timeout: float = 20) -> None:
 
 @pytest.fixture(scope="session")
 def app_url():
-    """Levanta backend (FastAPI) y frontend (Vite) reales y los cierra al terminar."""
+    """URL de la app a probar.
+
+    Si existe APP_BASE_URL (Pre-Prod), usa esa app ya desplegada. Si no, levanta
+    backend (FastAPI) y frontend (Vite) reales en local y los cierra al terminar.
+    """
+    remota = os.environ.get("APP_BASE_URL", "").rstrip("/")
+    if remota:
+        yield remota
+        return
+
     for port in (API_PORT, WEB_PORT):
         assert _port_free(port), f"El puerto {port} está ocupado"
 
