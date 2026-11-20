@@ -27,13 +27,68 @@ concurrency:
 
 jobs:
   # ---------------------------------------------------------------------------
+  # 0. Detectar qué carpetas cambió el PR (backend, frontend, infra)
+  #    Solo filtra en los PR. En un push a develop/main siempre corre todo, porque
+  #    esas ejecuciones publican las imágenes y despliegan.
+  #    Los jobs de abajo conservan sus nombres (los checks de la protección de rama
+  #    no cambian); lo que se omite son los pasos de la parte que no cambió.
+  # ---------------------------------------------------------------------------
+  changes:
+    name: Detectar cambios
+    if: ${{ github.event_name != 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read  # paths-filter lista los archivos del PR con la API
+    outputs:
+      backend: ${{ steps.resolver.outputs.backend }}
+      frontend: ${{ steps.resolver.outputs.frontend }}
+      infra: ${{ steps.resolver.outputs.infra }}
+    steps:
+      - name: Detectar carpetas modificadas (solo PR)
+        id: filtro
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad  # v3 (fijada por SHA)
+        with:
+          filters: |
+            backend:
+              - 'backend-fastapi/**'
+              - '.github/workflows/pipeline.yml'
+              - '.github/actions/setup/**'
+            frontend:
+              - 'frontend/**'
+              - '.github/workflows/pipeline.yml'
+              - '.github/actions/setup/**'
+            infra:
+              - 'infra/**'
+              - '.github/workflows/pipeline.yml'
+
+      - name: Resolver qué partes se prueban
+        id: resolver
+        env:
+          EVENTO: ${{ github.event_name }}
+          FILTRO_BACKEND: ${{ steps.filtro.outputs.backend }}
+          FILTRO_FRONTEND: ${{ steps.filtro.outputs.frontend }}
+          FILTRO_INFRA: ${{ steps.filtro.outputs.infra }}
+        run: |
+          if [ "$EVENTO" = "pull_request" ]; then
+            backend="$FILTRO_BACKEND"; frontend="$FILTRO_FRONTEND"; infra="$FILTRO_INFRA"
+          else
+            backend=true; frontend=true; infra=true
+          fi
+          echo "backend=${backend}"   >> "$GITHUB_OUTPUT"
+          echo "frontend=${frontend}" >> "$GITHUB_OUTPUT"
+          echo "infra=${infra}"       >> "$GITHUB_OUTPUT"
+          echo "Backend: ${backend} | Frontend: ${frontend} | Infra: ${infra}"
+
+  # ---------------------------------------------------------------------------
   # 1-2. Checkout + Build
   # ---------------------------------------------------------------------------
   build:
     name: Build
     # Si Validar origen falla, no se ejecuta nada más. Si se omite (PR a develop o push), sigue normal.
-    needs: validar-origen
-    if: ${{ !cancelled() && github.event_name != 'workflow_dispatch' && (needs.validar-origen.result == 'success' || needs.validar-origen.result == 'skipped') }}
+    needs: [validar-origen, changes]
+    if: ${{ !cancelled() && github.event_name != 'workflow_dispatch' && needs.changes.result == 'success' && (needs.validar-origen.result == 'success' || needs.validar-origen.result == 'skipped') }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -41,12 +96,17 @@ jobs:
 
       - name: Install dependencies
         uses: ./.github/actions/setup
+        with:
+          backend: ${{ needs.changes.outputs.backend }}
+          frontend: ${{ needs.changes.outputs.frontend }}
 
       - name: Build backend (compilar módulos Python)
+        if: ${{ needs.changes.outputs.backend == 'true' }}
         working-directory: backend-fastapi
         run: python -m compileall -q app
 
       - name: Build frontend (vite build)
+        if: ${{ needs.changes.outputs.frontend == 'true' }}
         working-directory: frontend
         run: npm run build
 
@@ -55,7 +115,7 @@ jobs:
   # ---------------------------------------------------------------------------
   test-static:
     name: Test estáticas
-    needs: build
+    needs: [build, changes]
     # Se repite el if: si un job anterior (validar-origen) se omite, el implícito success() omitiría este también.
     if: ${{ !cancelled() && needs.build.result == 'success' }}
     runs-on: ubuntu-latest
@@ -65,27 +125,36 @@ jobs:
 
       - name: Install dependencies
         uses: ./.github/actions/setup
+        with:
+          backend: ${{ needs.changes.outputs.backend }}
+          frontend: ${{ needs.changes.outputs.frontend }}
 
       - name: Black (formato backend)
+        if: ${{ needs.changes.outputs.backend == 'true' }}
         working-directory: backend-fastapi
         run: black --check app tests
 
       - name: Flake8 (linter backend)
+        if: ${{ needs.changes.outputs.backend == 'true' }}
         working-directory: backend-fastapi
         run: flake8 app tests
 
       - name: Pylint (linter backend)
+        if: ${{ needs.changes.outputs.backend == 'true' }}
         working-directory: backend-fastapi
         run: pylint app
 
       - name: ESLint (linter frontend)
+        if: ${{ needs.changes.outputs.frontend == 'true' }}
         working-directory: frontend
         run: npm run lint
 
       - name: Set up Terraform
+        if: ${{ needs.changes.outputs.infra == 'true' }}
         uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e  # v4.0.1 (fijada por SHA)
 
       - name: Terraform fmt y validate (infraestructura)
+        if: ${{ needs.changes.outputs.infra == 'true' }}
         run: |
           terraform fmt -check -recursive infra
           for dir in infra infra/ecr; do
@@ -98,7 +167,7 @@ jobs:
   # ---------------------------------------------------------------------------
   test-unit:
     name: Test unitarias
-    needs: build
+    needs: [build, changes]
     if: ${{ !cancelled() && needs.build.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
@@ -107,12 +176,17 @@ jobs:
 
       - name: Install dependencies
         uses: ./.github/actions/setup
+        with:
+          backend: ${{ needs.changes.outputs.backend }}
+          frontend: ${{ needs.changes.outputs.frontend }}
 
       - name: Pytest (backend)
+        if: ${{ needs.changes.outputs.backend == 'true' }}
         working-directory: backend-fastapi
         run: pytest --no-cov
 
       - name: Vitest (frontend)
+        if: ${{ needs.changes.outputs.frontend == 'true' }}
         working-directory: frontend
         run: npm test
 
@@ -121,7 +195,7 @@ jobs:
   # ---------------------------------------------------------------------------
   test-coverage:
     name: Test cobertura
-    needs: test-unit
+    needs: [test-unit, changes]
     if: ${{ !cancelled() && needs.test-unit.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
@@ -130,30 +204,41 @@ jobs:
 
       - name: Install dependencies
         uses: ./.github/actions/setup
+        with:
+          backend: ${{ needs.changes.outputs.backend }}
+          frontend: ${{ needs.changes.outputs.frontend }}
 
       - name: Cobertura backend (pytest-cov, mínimo 80 %)
+        if: ${{ needs.changes.outputs.backend == 'true' }}
         working-directory: backend-fastapi
         run: pytest --cov-fail-under=80
 
       - name: Cobertura frontend (vitest, mínimo 80 %)
+        if: ${{ needs.changes.outputs.frontend == 'true' }}
         working-directory: frontend
         run: npm run test:cov
 
-      - name: Subir reportes de cobertura
-        if: always()
+      # Un artefacto por parte: así Sonar sabe dónde dejar cada reporte aunque falte uno.
+      - name: Subir reporte de cobertura del backend
+        if: ${{ always() && needs.changes.outputs.backend == 'true' }}
         uses: actions/upload-artifact@v7
         with:
-          name: coverage-reports
-          path: |
-            backend-fastapi/coverage/
-            frontend/coverage/
+          name: coverage-backend
+          path: backend-fastapi/coverage/
+
+      - name: Subir reporte de cobertura del frontend
+        if: ${{ always() && needs.changes.outputs.frontend == 'true' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-frontend
+          path: frontend/coverage/
 
   # ---------------------------------------------------------------------------
   # 5b. SonarCloud (análisis de calidad con Quality Gate, usa los reportes de cobertura)
   # ---------------------------------------------------------------------------
   sonarcloud:
     name: SonarCloud
-    needs: test-coverage
+    needs: [test-coverage, changes]
     if: ${{ !cancelled() && needs.test-coverage.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
@@ -162,10 +247,19 @@ jobs:
         with:
           fetch-depth: 0  # SonarCloud necesita el historial completo para saber qué es código nuevo
 
-      - name: Descargar reportes de cobertura
+      - name: Descargar cobertura del backend
+        if: ${{ needs.changes.outputs.backend == 'true' }}
         uses: actions/download-artifact@v7
         with:
-          name: coverage-reports
+          name: coverage-backend
+          path: backend-fastapi/coverage
+
+      - name: Descargar cobertura del frontend
+        if: ${{ needs.changes.outputs.frontend == 'true' }}
+        uses: actions/download-artifact@v7
+        with:
+          name: coverage-frontend
+          path: frontend/coverage
 
       - name: SonarCloud Scan
         uses: SonarSource/sonarqube-scan-action@59202af334b4ba7b5db01b701b8e79f8b3bef0f4  # v8.5.0 (fijada por SHA, lo exige SonarCloud)
