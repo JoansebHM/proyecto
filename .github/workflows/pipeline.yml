@@ -268,8 +268,9 @@ jobs:
           SONAR_HOST_URL: https://sonarcloud.io
 
   # ---------------------------------------------------------------------------
-  # 6. Release: construir, escanear (Trivy) y publicar las imágenes en ECR
-  #    Solo corre al integrar en develop o main (no en los PR).
+  # 6. Release: en develop construye, escanea (Trivy) y publica las imágenes en ECR.
+  #    En main NO construye: promueve la imagen que ya se publicó (y probó en staging)
+  #    con el push a develop. Solo corre al integrar en develop o main (no en los PR).
   # ---------------------------------------------------------------------------
   release:
     name: Release
@@ -281,9 +282,11 @@ jobs:
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
       AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
       AWS_DEFAULT_REGION: us-east-1
+    permissions:
+      contents: read
+      pull-requests: read  # para encontrar el PR develop -> main de este commit
     outputs:
-      backend_image: ${{ steps.imagenes.outputs.backend_image }}
-      frontend_image: ${{ steps.imagenes.outputs.frontend_image }}
+      version: ${{ steps.version.outputs.version }}  # SHA de las imágenes que se despliegan
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -295,20 +298,56 @@ jobs:
           aws ecr get-login-password | docker login --username AWS --password-stdin "$REGISTRY"
           echo "registry=$REGISTRY" >> "$GITHUB_OUTPUT"
 
+      # develop: la versión es este commit. main: es el commit de develop que se integró por PR,
+      # es decir, el que ya se construyó, publicó y probó en staging.
+      - name: Definir la versión (SHA) que se despliega
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$GITHUB_REF" = "refs/heads/develop" ]; then
+            version="$GITHUB_SHA"
+            echo "develop: se construye y publica el commit ${version}"
+          else
+            version="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls" \
+              --jq '[.[] | select(.base.ref == "main" and .head.ref == "develop")][0].head.sha // empty')"
+            if ! [[ "$version" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::No se encontró el PR develop -> main de este commit, no hay imagen que promover. Para desplegar un SHA concreto usa Run workflow (Rollback manual)."
+              exit 1
+            fi
+            echo "main: se promueve el commit ${version} de develop (sin reconstruir la imagen)"
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Verificar que las imágenes a promover existen en ECR
+        if: ${{ github.ref == 'refs/heads/main' }}
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          for componente in backend frontend; do
+            aws ecr describe-images --repository-name "proyecto-${componente}" --image-ids "imageTag=${VERSION}" > /dev/null \
+              || { echo "::error::No existe proyecto-${componente}:${VERSION} en ECR. ¿Ese commit de develop llegó a publicarse?"; exit 1; }
+          done
+          echo "Imágenes proyecto-backend y proyecto-frontend con la etiqueta ${VERSION} encontradas."
+
       - name: Definir nombres de las imágenes (etiqueta = SHA del commit)
         id: imagenes
+        if: ${{ github.ref == 'refs/heads/develop' }}
         run: |
           echo "backend_image=${{ steps.ecr.outputs.registry }}/proyecto-backend:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
           echo "frontend_image=${{ steps.ecr.outputs.registry }}/proyecto-frontend:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
 
       - name: Build imagen del backend
+        if: ${{ github.ref == 'refs/heads/develop' }}
         run: docker build -t "${{ steps.imagenes.outputs.backend_image }}" backend-fastapi
 
       - name: Build imagen del frontend
+        if: ${{ github.ref == 'refs/heads/develop' }}
         run: docker build -t "${{ steps.imagenes.outputs.frontend_image }}" frontend
 
       # Trivy falla el pipeline si encuentra vulnerabilidades CRÍTICAS que ya tengan corrección.
       - name: Escaneo Trivy del backend
+        if: ${{ github.ref == 'refs/heads/develop' }}
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0 (fijada por SHA)
         with:
           image-ref: ${{ steps.imagenes.outputs.backend_image }}
@@ -318,6 +357,7 @@ jobs:
           format: table
 
       - name: Escaneo Trivy del frontend
+        if: ${{ github.ref == 'refs/heads/develop' }}
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0 (fijada por SHA)
         with:
           image-ref: ${{ steps.imagenes.outputs.frontend_image }}
@@ -327,6 +367,7 @@ jobs:
           format: table
 
       - name: Publicar imágenes en ECR (SHA y latest)
+        if: ${{ github.ref == 'refs/heads/develop' }}
         run: |
           for componente in backend frontend; do
             imagen="${{ steps.ecr.outputs.registry }}/proyecto-${componente}"
@@ -470,6 +511,9 @@ jobs:
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
       AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
       AWS_DEFAULT_REGION: us-east-1
+      VERSION: ${{ needs.release.outputs.version }}  # SHA promovido desde develop
+    outputs:
+      version: ${{ needs.release.outputs.version }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -485,11 +529,11 @@ jobs:
       - name: Seleccionar el workspace production (se crea si no existe)
         run: terraform -chdir=infra workspace select -or-create production
 
-      - name: Terraform plan (imágenes con el SHA del commit)
+      - name: Terraform plan (mismas imágenes que se probaron en staging)
         run: |
           terraform -chdir=infra plan -input=false \
             -var "environment_name=production" \
-            -var "image_tag=${GITHUB_SHA}" \
+            -var "image_tag=${VERSION}" \
             -out=tfplan
 
       - name: Subir el plan para que Deploy aplique exactamente este plan
@@ -518,6 +562,7 @@ jobs:
       AWS_DEFAULT_REGION: us-east-1
     outputs:
       app_url: ${{ steps.salida.outputs.app_url }}
+      version: ${{ needs.iac-production.outputs.version }}
       version_anterior: ${{ steps.anterior.outputs.version }}
     steps:
       - name: Checkout
@@ -569,13 +614,13 @@ jobs:
     runs-on: ubuntu-latest
     env:
       APP_BASE_URL: ${{ needs.deploy-production.outputs.app_url }}
-      EXPECTED_VERSION: ${{ github.sha }}
+      EXPECTED_VERSION: ${{ needs.deploy-production.outputs.version }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Esperar la versión nueva en /api/health (cada 10 s, máximo 5 min)
-        run: scripts/esperar-version.sh "$APP_BASE_URL" "$GITHUB_SHA"
+      - name: Esperar la versión promovida en /api/health (cada 10 s, máximo 5 min)
+        run: scripts/esperar-version.sh "$APP_BASE_URL" "$EXPECTED_VERSION"
 
       - name: Set up Python
         uses: actions/setup-python@v7
